@@ -1,14 +1,19 @@
+"""
+Anatomy-Constrained Conditional Latent Diffusion Training Framework
+Optimized for Structural Regulation via Relation Control (ReLaCtrl) Blocks.
+Targets dual-class pathology optimization (0: No_Finding, 1: Pneumonia).
+Enhanced with Batch-Level Structural Weighting and Dynamic Plateau Adaptivity.
+"""
+
 import os
-import platform
-import argparse
+import csv
 import logging
+import platform
 from time import time
 from glob import glob
 from copy import deepcopy
-from collections import OrderedDict
 
 import torch
-import torch.distributed as dist
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -16,383 +21,488 @@ from torchvision import transforms
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel
 
-from models import sit_models
-from rela_ctrl_wrapper import SitRelaCtrlWrapper
+from models import SiT_models                        
+from rela_ctrl_wrapper import SiTRelaCtrlWrapper     
 from download import find_model
 from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
 from train_utils import parse_transport_args
-import wandb_utils
 
+# Optimize CUDA operations for modern Ampere/Ada Lovelace architectures
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 torch.backends.cudnn.allow_tf32 = True
 
-class CenterCropTransform:
-    def __init__(self, image_size):
-        self.image_size = image_size
 
-    def __call__(self, pil_image):
-        return center_crop_arr(pil_image, self.image_size)
+class TransportInterfaceAdapter(torch.nn.Module):
+    """
+    Interface adapter designed to enforce strict dimensional compliance 
+    between downstream custom wrappers and external transport layer logic.
+    """
+    def __init__(self, execution_model, unpatchify_functional):
+        super().__init__()
+        self.execution_model = execution_model
+        self.unpatchify_functional = unpatchify_functional
 
-def _win_get_world_size(): return 1
-def _win_get_rank(): return 0
-def _win_barrier(): return None
-def _win_all_reduce(tensor, op=None): return None
-def _win_all_gather_into_tensor(output_tensor, input_tensor): output_tensor.copy_(input_tensor)
-def _win_destroy_process_group(): return None
-def _win_is_initialized(): return True
+    def _enforce_structural_dimensions(self, tensor_output, reference_shape):
+        if isinstance(tensor_output, tuple):
+            tensor_output = tensor_output[0]
+        if tensor_output.ndim == 3:
+            tensor_output = self.unpatchify_functional(tensor_output)
+        if tensor_output.ndim == 4 and tensor_output.size(1) == reference_shape[1] * 2:
+            tensor_output, _ = tensor_output.chunk(2, dim=1)
+        return tensor_output
 
-def cache_latents_if_needed(data_path, image_size, vae_name, device):
-    images_dir = os.path.join(data_path, "images")
-    latents_dir = os.path.join(data_path, "latents")
-    
-    existing_latents = glob(os.path.join(latents_dir, "*", "*.pt"))
-    if len(existing_latents) > 0:
-        return latents_dir
+    def forward(self, x, t, **kwargs):
+        raw_output = self.execution_model(x, t, **kwargs)
+        return self._enforce_structural_dimensions(raw_output, x.shape)
 
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{vae_name}").to(device)
-    vae.eval()
-    
-    transform = transforms.Compose([
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
+    def forward_with_cfg(self, x, t, **kwargs):
+        raw_output = self.execution_model.forward_with_cfg(x, t, **kwargs)
+        return self._enforce_structural_dimensions(raw_output, x.shape)
 
-    classes = ["No_Finding", "Pneumonia"]
-    for class_name in classes:
-        src_folder = os.path.join(images_dir, class_name)
-        tgt_folder = os.path.join(latents_dir, class_name)
-        os.makedirs(tgt_folder, exist_ok=True)
-        
-        if not os.path.exists(src_folder):
-            continue
-            
-        images = [f for f in os.listdir(src_folder) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        
-        with torch.no_grad():
-            for img_name in tqdm(images):
-                img_path = os.path.join(src_folder, img_name)
-                img = Image.open(img_path).convert('RGB')
-                img_tensor = transform(img).unsqueeze(0).to(device)
-                
-                latent = vae.encode(img_tensor).latent_dist.sample().mul_(0.18215)
-                latent = latent.squeeze(0).cpu()
-                
-                save_name = os.path.splitext(img_name)[0] + ".pt"
-                torch.save(latent, os.path.join(tgt_folder, save_name))
-                
-    del vae
-    torch.cuda.empty_cache()
-    return latents_dir
 
-class LatentXRayMaskDataset(Dataset):
-    def __init__(self, latents_dir, masks_dir, image_size):
-        self.samples = []
-        self.classes = ["No_Finding", "Pneumonia"]
-        
-        for class_idx, class_name in enumerate(self.classes):
-            latent_class_dir = os.path.join(latents_dir, class_name)
-            mask_class_dir = os.path.join(masks_dir, class_name)
-            
-            if not os.path.exists(latent_class_dir) or not os.path.exists(mask_class_dir):
-                continue
-                
-            for file_name in os.listdir(latent_class_dir):
-                if file_name.endswith('.pt'):
-                    base_name = os.path.splitext(file_name)[0]
-                    mask_path = None
-                    for ext in ['.png', '.jpg', '.jpeg']:
-                        temp_path = os.path.join(mask_class_dir, base_name + "_organ_mask" + ext)
-                        if os.path.exists(temp_path):
-                            mask_path = temp_path
-                            break
-                    
-                    if mask_path:
-                        latent_path = os.path.join(latent_class_dir, file_name)
-                        self.samples.append((latent_path, mask_path, class_idx))
-                        
-        latent_size = image_size // 8
-        self.mask_transform = transforms.Compose([
-            transforms.Resize((latent_size, latent_size), interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.ToTensor() 
+class IdentityDistributedParallel(torch.nn.Module):
+    """
+    Fallback context wrapper mapping execution models uniformly within 
+    single-device environments while maintaining interface parity with DDP.
+    """
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+# Distributed Execution Environment Stubs for Windows Compatibility
+def _runtime_get_world_size(): return 1
+def _runtime_get_rank(): return 0
+def _runtime_barrier(): return None
+
+
+class LatentAnatomyDataset(Dataset):
+    """
+    Optimized data engine handling aligned execution elements:
+    Cached Tensor Latents, Structural Control Maps, and Categorical Ground Truths.
+    """
+    def __init__(self, manifest_samples, latents_directory, target_resolution):
+        self.samples = manifest_samples
+        self.latents_directory = latents_directory
+        spatial_dimension = target_resolution // 8
+        self.mask_operator = transforms.Compose([
+            transforms.Resize((spatial_dimension, spatial_dimension),
+                              interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor(),
         ])
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        latent_path, mask_path, label = self.samples[idx]
-        latent = torch.load(latent_path)
-        mask_img = Image.open(mask_path).convert('L')
-        mask_tensor = self.mask_transform(mask_img)
-        return latent, mask_tensor, label
+        target_sample = self.samples[idx]
+        latent_tensor_path = os.path.join(self.latents_directory, f"{target_sample['dicom_id']}.pt")
+        latent_tensor = torch.load(latent_tensor_path, weights_only=True)
+        
+        mask_image = Image.open(target_sample['mask_path']).convert('RGB')
+        mask_tensor = self.mask_operator(mask_image)
+        
+        return latent_tensor, mask_tensor, target_sample['label']
+
+
+def parse_and_validate_manifest(base_data_path):
+    manifest_csv = os.path.join(base_data_path, "master_multipathology_manifest.csv")
+    source_images = os.path.join(base_data_path, "local_images")
+    structural_maps = os.path.join(base_data_path, "local_maps", "local_maps")
+    
+    verified_records = []
+    if not os.path.exists(manifest_csv):
+        raise FileNotFoundError(f"Target system manifest missing at path: {manifest_csv}")
+
+    with open(manifest_csv, mode='r', encoding='utf-8') as stream:
+        dictionary_reader = csv.DictReader(stream)
+        for line_item in dictionary_reader:
+            dicom_identifier = line_item.get('dicom_id')
+            if not dicom_identifier:
+                continue
+            
+            try:
+                null_finding_flag = float(line_item.get('No Finding') or 0)
+                pathology_pneumonia_flag = float(line_item.get('Pneumonia') or 0)
+            except ValueError:
+                continue
+
+            if int(null_finding_flag) == 1:
+                assigned_class = 0
+            elif int(pathology_pneumonia_flag) == 1:
+                assigned_class = 1
+            else:
+                continue
+
+            image_file_path = os.path.join(source_images, f"{dicom_identifier}.jpg")
+            mask_file_path = os.path.join(structural_maps, f"{dicom_identifier}_anatomic_map.png")
+
+            if os.path.exists(image_file_path) and os.path.exists(mask_file_path):
+                verified_records.append({
+                    'dicom_id': dicom_identifier,
+                    'img_path': image_file_path,
+                    'mask_path': mask_file_path,
+                    'label': assigned_class
+                })
+                
+    return verified_records
+
+
+def execute_latent_caching_pass(records, data_path, resolution, vae_identifier, execution_device):
+    cache_directory = os.path.join(data_path, "local_latents")
+    os.makedirs(cache_directory, exist_ok=True)
+    
+    discovered_caches = glob(os.path.join(cache_directory, "*.pt"))
+    if len(discovered_caches) >= len(records) and len(records) > 0:
+        return cache_directory
+
+    vae_model = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{vae_identifier}").to(execution_device).eval()
+    normalization_pipeline = transforms.Compose([
+        transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(resolution),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+    
+    with torch.no_grad():
+        for record in tqdm(records, desc="Executing Latent Cache Generation"):
+            target_path = os.path.join(cache_directory, f"{record['dicom_id']}.pt")
+            if os.path.exists(target_path):
+                continue
+            raw_pixel_tensor = normalization_pipeline(Image.open(record['img_path']).convert('RGB')).unsqueeze(0).to(execution_device)
+            latent_space_distribution = vae_model.encode(raw_pixel_tensor).latent_dist.sample()
+            scaled_latent_tensor = latent_space_distribution.mul_(0.18215).squeeze(0).cpu()
+            torch.save(scaled_latent_tensor, target_path)
+            
+    del vae_model
+    torch.cuda.empty_cache()
+    return cache_directory
+
 
 @torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+def SynchronizeExponentialMovingAverage(target_ema_model, training_source_model, decay_factor=0.9999):
+    for (source_name, source_param), (_, ema_param) in zip(training_source_model.named_parameters(), target_ema_model.named_parameters()):
+        ema_param.mul_(decay_factor).add_(source_param.data, alpha=1 - decay_factor)
 
-def requires_grad(model, flag=True):
-    for p in model.parameters():
-        p.requires_grad = flag
 
-def cleanup():
-    dist.destroy_process_group()
+def configure_parameter_gradients(model_hierarchy, enable_gradients=True):
+    for parameter in model_hierarchy.parameters():
+        parameter.requires_grad = enable_gradients
 
-def create_logger(logging_dir):
-    if dist.get_rank() == 0:
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+
+def instantiate_system_logger(output_directory):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[logging.StreamHandler(), logging.FileHandler(f"{output_directory}/production_execution.log")],
+    )
+    return logging.getLogger(__name__)
+
+
+def main(hyperparameters):
+    assert torch.cuda.is_available(), "Critical Error: Execution requires operational CUDA environment."
+
+    # Initialize Distributed Run Environments
+    if platform.system() == "Windows":
+        import torch.distributed as active_distribution
+        active_distribution.get_world_size = _runtime_get_world_size
+        active_distribution.get_rank = _runtime_get_rank
+        active_distribution.barrier = _runtime_barrier
+    else:
+        import torch.distributed as active_distribution
+        active_distribution.init_process_group("nccl")
+
+    system_rank = active_distribution.get_rank()
+    target_device_id = system_rank % torch.cuda.device_count()
+    computed_local_batch_size = hyperparameters.global_batch_size // active_distribution.get_world_size()
+    
+    torch.manual_seed(hyperparameters.global_seed)
+    torch.cuda.set_device(target_device_id)
+
+    # Output directory scaffolding
+    if system_rank == 0:
+        os.makedirs(hyperparameters.results_dir, exist_ok=True)
+        allocation_index = len(glob(f"{hyperparameters.results_dir}/*"))
+        experiment_identifier = f"{allocation_index:03d}-SiTRelaCtrl-{hyperparameters.path_type}-{hyperparameters.prediction}"
+        experiment_path = f"{hyperparameters.results_dir}/{experiment_identifier}"
+        checkpoint_path = f"{experiment_path}/checkpoints"
+        visualization_path = f"{experiment_path}/diagnostics"
+        os.makedirs(checkpoint_path, exist_ok=True)
+        os.makedirs(visualization_path, exist_ok=True)
+        system_logger = instantiate_system_logger(experiment_path)
+        system_logger.info(f"Initialized Experiment Path: {experiment_path}")
+    else:
+        system_logger = logging.getLogger(__name__)
+        system_logger.addHandler(logging.NullHandler())
+
+    curated_records = parse_and_validate_manifest(hyperparameters.data_path)
+    if not curated_records:
+        raise ValueError("Data Validation Failure: Zero matching pairs extracted from manifest.")
+
+    if system_rank == 0:
+        latents_directory_path = execute_latent_caching_pass(
+            curated_records, hyperparameters.data_path, hyperparameters.image_size, hyperparameters.vae, target_device_id
         )
-        logger = logging.getLogger(__name__)
-    else:
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
+    active_distribution.barrier()
+    if system_rank != 0:
+        latents_directory_path = os.path.join(hyperparameters.data_path, "local_latents")
 
-def center_crop_arr(pil_image, image_size):
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+    inferred_latent_resolution = hyperparameters.image_size // 8
 
-def main(args):
+    # Base Architecture Deployment
+    structural_backbone = SiT_models[hyperparameters.model](
+        input_size=inferred_latent_resolution,
+        num_classes=2                                    
+    ).to(target_device_id)
+
+    if hyperparameters.ckpt and not hyperparameters.resume:
+        resolved_checkpoint = find_model(hyperparameters.ckpt)
+        extracted_weights = resolved_checkpoint.get("ema", resolved_checkpoint.get("model", resolved_checkpoint))
+        backbone_state_map = structural_backbone.state_dict()
+        compliant_weights = {k: v for k, v in extracted_weights.items()
+                             if k in backbone_state_map and v.shape == backbone_state_map[k].shape}
+        backbone_state_map.update(compliant_weights)
+        structural_backbone.load_state_dict(backbone_state_map)
+        system_logger.info(f"Loaded Core Backbone Model: {len(compliant_weights)} parameters synchronized.")
+
+    # Relation Control Structural Wrapper Integration
+    optimization_model = SiTRelaCtrlWrapper(                    
+        base_sit_model=structural_backbone,
+        condition_channels=3,
+        relevant_layers=[2, 4, 6, 8, 10, 12, 14],
+    ).to(target_device_id)
+
+    active_gradients = [p for p in optimization_model.parameters() if p.requires_grad]
+    system_logger.info(f"Active Trainable Parameters: {sum(p.numel() for p in active_gradients):,} | "
+                       f"Frozen Base Weight Matrices: {sum(p.numel() for p in structural_backbone.parameters()):,}")
+
+    historical_ema_model = deepcopy(optimization_model).to(target_device_id)
+    configure_parameter_gradients(historical_ema_model, False)
+    SynchronizeExponentialMovingAverage(historical_ema_model, optimization_model, decay_factor=0)
+
     if platform.system() == "Windows":
-        dist.get_world_size = _win_get_world_size
-        dist.get_rank = _win_get_rank
-        dist.barrier = _win_barrier
-        dist.all_reduce = _win_all_reduce
-        dist.all_gather_into_tensor = _win_all_gather_into_tensor
-        dist.destroy_process_group = _win_destroy_process_group
-        dist.is_initialized = _win_is_initialized
+        execution_ddp_wrapper = IdentityDistributedParallel(optimization_model)
     else:
-        dist.init_process_group("nccl")
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        execution_ddp_wrapper = DDP(optimization_model, device_ids=[target_device_id])
 
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    # Transport Layer Configurations
+    sanitized_training_interface = TransportInterfaceAdapter(execution_ddp_wrapper, structural_backbone.unpatchify)
+    sanitized_evaluation_interface = TransportInterfaceAdapter(historical_ema_model, structural_backbone.unpatchify)
 
-    if rank == 0:
-        latents_dir = cache_latents_if_needed(args.data_path, args.image_size, args.vae, device)
-    dist.barrier()
+    transport_infrastructure = create_transport(
+        hyperparameters.path_type, hyperparameters.prediction, hyperparameters.loss_weight,
+        hyperparameters.train_eps, hyperparameters.sample_eps
+    )
+    transport_sampling_engine = Sampler(transport_infrastructure)
+
+    # Diagnostic VAE Engine Configuration
+    vae_decoder = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{hyperparameters.vae}").to(target_device_id).eval()
+    configure_parameter_gradients(vae_decoder, False)
+
+    system_optimizer = torch.optim.AdamW(active_gradients, lr=hyperparameters.lr, weight_decay=0)
     
-    if rank != 0:
-        latents_dir = os.path.join(args.data_path, "latents")
+    # ── PROGRESSIVE PLATEAU SCHEDULER CONFIGURATION ──
+    execution_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        system_optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
+    )
 
-    samples_dir = ""
-    if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")
-        experiment_name = f"{experiment_index:03d}-{model_string_name}-{args.path_type}-{args.prediction}-{args.loss_weight}-Latent"
-        experiment_dir = f"{args.results_dir}/{experiment_name}"
-        checkpoint_dir = f"{experiment_dir}/checkpoints"
-        samples_dir = f"{experiment_dir}/samples"
-        
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        os.makedirs(samples_dir, exist_ok=True)
-        
-        logger = create_logger(experiment_dir)
-        if args.wandb:
-            wandb_utils.initialize(args, os.environ.get("entity", "default_entity"), experiment_name, os.environ.get("project", "default_project"))
-    else:
-        logger = create_logger(None)
-
-    latent_size = args.image_size // 8
-    base_model = sit_models[args.model](input_size=latent_size, num_classes=args.num_classes)
-    
-    model_weights = None
-    ema_weights = None
-
-    if args.ckpt is not None:
-        state_dict = find_model(args.ckpt)
-        if "model" in state_dict:
-            model_weights = state_dict["model"]
-            ema_weights = state_dict["ema"]
+    # ── CHECKPOINT RESUMPTION LIFECYCLE ENGINE ──
+    starting_epoch_idx = 0
+    if hyperparameters.resume:
+        if os.path.isfile(hyperparameters.resume):
+            system_logger.info(f"Targeting recovery checkpoint: '{hyperparameters.resume}'")
+            checkpoint_state = torch.load(hyperparameters.resume, map_location=f"cuda:{target_device_id}")
+            
+            # Map structural weights uniform across multi-device execution wrappers
+            optimization_model.load_state_dict(checkpoint_state["model"])
+            historical_ema_model.load_state_dict(checkpoint_state["ema"])
+            system_optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
+            
+            starting_epoch_idx = checkpoint_state["epoch"] + 1
+            system_logger.info(f"Recovery mapping verified. Re-entering execution stream at Epoch: {starting_epoch_idx}")
+            del checkpoint_state
+            torch.cuda.empty_cache()
         else:
-            model_weights = state_dict
-            ema_weights = state_dict
-            
-        model_dict = base_model.state_dict()
-        filtered_model = {k: v for k, v in model_weights.items() if k in model_dict and v.shape == model_dict[k].shape}
-        model_dict.update(filtered_model)
-        base_model.load_state_dict(model_dict)
+            raise FileNotFoundError(f"Recovery target file path signature missing: '{hyperparameters.resume}'")
 
-    model = SitRelaCtrlWrapper(
-        base_sit_model=base_model,
-        condition_channels=1, 
-        relevant_layers=[2, 4, 6, 8, 10, 12, 14]
-    ).to(device)
+    target_dataset = LatentAnatomyDataset(curated_records, latents_directory_path, hyperparameters.image_size)
+    execution_sampler = DistributedSampler(
+        target_dataset, num_replicas=active_distribution.get_world_size(),
+        rank=system_rank, shuffle=True, seed=hyperparameters.global_seed
+    )
+    data_loader = DataLoader(
+        target_dataset, batch_size=computed_local_batch_size, shuffle=False,
+        sampler=execution_sampler, num_workers=hyperparameters.num_workers,
+        pin_memory=True, drop_last=True
+    )
+    system_logger.info(f"Dataset Verified. Volume: {len(target_dataset)} samples | Total Batches per Epoch: {len(data_loader)}")
 
-    ema = deepcopy(model).to(device)
-    requires_grad(ema, False)
+    # Isolate Constant Diagnostic Batch For Multi-Column Analysis Tracking
+    diagnostic_latents, diagnostic_masks, diagnostic_labels = [], [], []
+    for step_idx in range(min(computed_local_batch_size, len(target_dataset))):
+        lat_instance, mask_instance, label_instance = target_dataset[step_idx]
+        diagnostic_latents.append(lat_instance)
+        diagnostic_masks.append(mask_instance)
+        diagnostic_labels.append(label_instance)
+    diagnostic_latents = torch.stack(diagnostic_latents).to(target_device_id)
+    diagnostic_masks = torch.stack(diagnostic_masks).to(target_device_id)
+    diagnostic_labels = torch.tensor(diagnostic_labels, dtype=torch.long, device=target_device_id)
 
-    if args.ckpt is not None and ema_weights is not None:
-        base_ema_dict = ema.base_model.state_dict()
-        filtered_ema = {k: v for k, v in ema_weights.items() if k in base_ema_dict and v.shape == base_ema_dict[k].shape}
-        base_ema_dict.update(filtered_ema)
-        ema.base_model.load_state_dict(base_ema_dict)
-
-    if platform.system() == "Windows":
-        class DummyDistributedDataParallel(torch.nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-            def forward(self, *args, **kwargs):
-                return self.module(*args, **kwargs)
-        model = DummyDistributedDataParallel(model.to(device))
-    else:
-        model = DistributedDataParallel(model.to(device), device_ids=[device])
-
-    transport = create_transport(args.path_type, args.prediction, args.loss_weight, args.train_eps, args.sample_eps)
-    transport_sampler = Sampler(transport)
+    noise_latents_seed = torch.randn_like(diagnostic_latents)
+    execute_cfg = hyperparameters.cfg_scale > 1.0
     
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    vae.eval()
-    requires_grad(vae, False)
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
-
-    masks_dir = os.path.join(args.data_path, "masks")
-    dataset = LatentXRayMaskDataset(latents_dir=latents_dir, masks_dir=masks_dir, image_size=args.image_size)
-
-    sampler = DistributedSampler(dataset, num_replicas=dist.get_world_size(), rank=rank, shuffle=True, seed=args.global_seed)
-    loader = DataLoader(dataset, batch_size=local_batch_size, shuffle=False, sampler=sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-
-    update_ema(ema, model.module, decay=0)
-    model.train()
-    ema.eval()
-
-    train_steps = 0
-    log_steps = 0
-    running_loss = 0
-    start_time = time()
-
-    use_cfg = args.cfg_scale > 1.0
-    n = local_batch_size
-    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
-    
-    val_masks = []
-    for i in range(n):
-        _, mask_tensor, _ = dataset[i]
-        val_masks.append(mask_tensor)
-
-    fixed_condition_masks = torch.stack(val_masks).to(device)
-
-    if use_cfg:
-        zs = torch.cat([zs, zs], 0)
-        cond_input = torch.cat([fixed_condition_masks, fixed_condition_masks], 0)
-        ys = torch.zeros(n * 2, dtype=torch.long, device=device) 
-        sample_model_kwargs = dict(y=ys, condition_img=cond_input, cfg_scale=args.cfg_scale)
-        model_fn = ema.forward_with_cfg
+    if execute_cfg:
+        stratified_noise = torch.cat([noise_latents_seed, noise_latents_seed], 0)
+        stratified_masks = torch.cat([diagnostic_masks, diagnostic_masks], 0)
+        stratified_labels = torch.cat([diagnostic_labels, diagnostic_labels], 0)
+        sampling_parameters = dict(y=stratified_labels, condition_img=stratified_masks, cfg_scale=hyperparameters.cfg_scale)
+        functional_sampling_target = sanitized_evaluation_interface.forward_with_cfg
     else:
-        ys = torch.zeros(n, dtype=torch.long, device=device)
-        sample_model_kwargs = dict(y=ys, condition_img=fixed_condition_masks)
-        model_fn = ema.forward
+        stratified_noise = noise_latents_seed
+        sampling_parameters = dict(y=diagnostic_labels, condition_img=diagnostic_masks)
+        functional_sampling_target = sanitized_evaluation_interface.forward
 
-    for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
-        for x, condition_img, y in loader:
-            x = x.to(device)
-            condition_img = condition_img.to(device)
-            y = y.to(device)
-            
-            model_kwargs = dict(y=y, condition_img=condition_img)
-            
+    optimal_monitored_loss = float("inf")
+    accumulated_training_steps = starting_epoch_idx * len(data_loader)
+    period_running_loss = 0.0
+    logged_steps_count = 0
+    temporal_anchor = time()
+
+    system_logger.info(f"Initiating Training Paradigm Across {hyperparameters.epochs} Epochs...")
+
+    for epoch_idx in range(starting_epoch_idx, hyperparameters.epochs):
+        execution_ddp_wrapper.train()
+        execution_sampler.set_epoch(epoch_idx)
+
+        for batch_x, batch_condition_mask, batch_y in data_loader:
+            batch_x = batch_x.to(target_device_id)
+            batch_condition_mask = batch_condition_mask.to(target_device_id)
+            batch_y = batch_y.to(target_device_id)
+
+            forward_arguments = dict(y=batch_y, condition_img=batch_condition_mask)
+
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                loss_dict = transport.training_losses(model, x, model_kwargs)
-                loss = loss_dict["loss"].mean()
+                loss_state = transport_infrastructure.training_losses(sanitized_training_interface, batch_x, forward_arguments)
+                base_loss_tensor = loss_state["loss"]  # Returns 1D Tensor: [Batch_Size]
                 
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
+                # ── BATCH-LEVEL ANATOMICAL STRUCTURAL WEIGHTING ENGINE ──
+                # Compute mask density profile per sample across spatial layers [B]
+                mask_density = batch_condition_mask.view(batch_condition_mask.size(0), -1).mean(dim=1)
+                
+                # Calculate penalty multiplier based on region importance
+                spatial_loss_modifier = 1.0 + (hyperparameters.anatomy_loss_multiplier * mask_density)
+                
+                # Apply structural constraint mapping directly to the reduced loss vector
+                minimized_loss = (base_loss_tensor * spatial_loss_modifier).mean()
 
-            running_loss += loss.item()
-            log_steps += 1
-            train_steps += 1
+            system_optimizer.zero_grad()
+            minimized_loss.backward()
             
-            if train_steps % args.log_every == 0:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                if args.wandb:
-                    wandb_utils.log({ "train loss": avg_loss, "train steps/sec": steps_per_sec }, step=train_steps)
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
-
-        current_epoch_count = epoch + 1
-        if current_epoch_count % 20 == 0:
-            if rank == 0:
-                checkpoint = {
-                    "model": model.module.state_dict(),
-                    "ema": ema.state_dict(),
-                    "opt": opt.state_dict(),
-                    "args": args
-                }
-                checkpoint_path = f"{checkpoint_dir}/latest_checkpoint.pt"
-                torch.save(checkpoint, checkpoint_path)
-            dist.barrier()
+            # Active stabilization via gradient clipping
+            torch.nn.utils.clip_grad_norm_(active_gradients, 1.0)
+            system_optimizer.step()
             
-            if rank == 0:
-                with torch.no_grad():
-                    sample_fn = transport_sampler.sample_ode()
-                    samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
-                    dist.barrier()
+            SynchronizeExponentialMovingAverage(historical_ema_model, execution_ddp_wrapper.module)
 
-                    if use_cfg:
-                        samples, _ = samples.chunk(2, dim=0)
-                    
-                    samples = vae.decode(samples / 0.18215).sample
-                    out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                    dist.all_gather_into_tensor(out_samples, samples)
+            period_running_loss += minimized_loss.item()
+            logged_steps_count += 1
+            accumulated_training_steps += 1
 
-                    if rank == 0:
-                        sample_path = f"{samples_dir}/epoch_{current_epoch_count:05d}.png"
-                        save_image(out_samples, sample_path, nrow=8, normalize=True, value_range=(-1, 1))
-            dist.barrier()
+            if accumulated_training_steps % hyperparameters.log_every == 0:
+                mean_loss_value = period_running_loss / logged_steps_count
+                processing_velocity = logged_steps_count / (time() - temporal_anchor)
+                current_lr = system_optimizer.param_groups[0]['lr']
+                system_logger.info(f"[Step {accumulated_training_steps:06d} | Epoch {epoch_idx:03d}] "
+                                   f"Loss State: {mean_loss_value:.5f} | LR: {current_lr:.2e} | Speed: {processing_velocity:.1f} steps/sec")
+                period_running_loss = 0.0
+                logged_steps_count = 0
+                temporal_anchor = time()
 
-    model.eval()
-    cleanup()
+        computed_epoch_loss = period_running_loss / max(logged_steps_count, 1)
+        
+        # Step dynamic scheduler with current average loss profile
+        execution_scheduler.step(computed_epoch_loss)
+
+        if system_rank == 0 and computed_epoch_loss < optimal_monitored_loss and computed_epoch_loss > 0:
+            optimal_monitored_loss = computed_epoch_loss
+            torch.save({
+                "epoch": epoch_idx, 
+                "model": execution_ddp_wrapper.module.state_dict(),
+                "ema": historical_ema_model.state_dict(), 
+                "optimizer_state_dict": system_optimizer.state_dict(),
+                "train_loss": optimal_monitored_loss,
+            }, f"{checkpoint_path}/best_structural_model.pt")
+
+        # ── THREE-COLUMN DIAGNOSTIC VISUALIZATION PIPELINE ──
+        if system_rank == 0 and (epoch_idx + 1) % hyperparameters.visualization_interval == 0:
+            execution_ddp_wrapper.eval()
+            with torch.no_grad():
+                ode_sampler_function = transport_sampling_engine.sample_ode()
+                generated_output_latents = ode_sampler_function(stratified_noise, functional_sampling_target, **sampling_parameters)[-1]
+                if execute_cfg:
+                    generated_output_latents, _ = generated_output_latents.chunk(2, dim=0)
+                
+                # Column 1: Reconstruction of Original Source Signal via Latent Space Decoding
+                original_images_decoded = vae_decoder.decode(diagnostic_latents / 0.18215).sample
+                original_images_decoded = (original_images_decoded.clamp(-1, 1) + 1) / 2
+                
+                # Column 2: Upsampled Conditioning Structural Anatomy Map
+                structural_masks_normalized = torch.nn.functional.interpolate(
+                    diagnostic_masks, size=(hyperparameters.image_size, hyperparameters.image_size), mode='nearest'
+                )
+                
+                # Column 3: Generated Inference Output Matrix
+                inferred_synthesis_decoded = vae_decoder.decode(generated_output_latents / 0.18215).sample
+                inferred_synthesis_decoded = (inferred_synthesis_decoded.clamp(-1, 1) + 1) / 2
+                
+                # Horizontal Matrix Synthesis Assembly
+                synchronized_diagnostic_rows = []
+                for sample_idx in range(diagnostic_latents.size(0)):
+                    evaluation_triplet = torch.cat([
+                        original_images_decoded[sample_idx], 
+                        structural_masks_normalized[sample_idx], 
+                        inferred_synthesis_decoded[sample_idx]
+                    ], dim=2)
+                    synchronized_diagnostic_rows.append(evaluation_triplet)
+                
+                consolidated_evaluation_sheet = torch.stack(synchronized_diagnostic_rows, dim=0)
+                save_image(
+                    consolidated_evaluation_sheet, 
+                    f"{visualization_path}/epoch_{epoch_idx+1:04d}_validation_comparison.png",
+                    nrow=1, normalize=False
+                )
+                system_logger.info(f"Diagnostic Analysis Sheet Extracted for Epoch {epoch_idx+1}.")
+            execution_ddp_wrapper.train()
+
+    system_logger.info("Training Run Concluded Successfully.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(sit_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema") 
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--cfg-scale", type=float, default=4.0)
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--ckpt", type=str, default=None)
+    import argparse
+    parser = argparse.ArgumentParser(description="Production Flow Matching Training Framework with ReLaCtrl Tuning.")
+    parser.add_argument("--data-path",                  type=str,   required=True, help="Path to raw assets root directory.")
+    parser.add_argument("--results-dir",                type=str,   default="results_relactrl_production")
+    parser.add_argument("--model",                      type=str,   default="SiT-XL/2", choices=list(SiT_models.keys()))
+    parser.add_argument("--image-size",                 type=int,   default=256, choices=[256, 512])
+    parser.add_argument("--epochs",                     type=int,   default=100)
+    parser.add_argument("--global-batch-size",          type=int,   default=16)
+    parser.add_argument("--global-seed",                type=int,   default=0)
+    parser.add_argument("--vae",                        type=str,   default="mse", choices=["ema", "mse"])
+    parser.add_argument("--num-workers",                type=int,   default=4)
+    parser.add_argument("--log-every",                  type=int,   default=50)
+    parser.add_argument("--visualization-interval",     type=int,   default=5, help="Epoch sequence step to trigger grid compilation.")
+    parser.add_argument("--anatomy-loss-multiplier",    type=float, default=2.5, help="Multiplier factor penalizing deviation inside mask anatomy boundaries.")
+    parser.add_argument("--dice-loss-weight",           type=float, default=0.5, help="Unused parameter retained for legacy CLI argument backward-compatibility.")
+    parser.add_argument("--cfg-scale",                  type=float, default=4.0)
+    parser.add_argument("--lr",                         type=float, default=1e-4)
+    parser.add_argument("--ckpt",                       type=str,   default=None, help="Path to pre-trained foundation weights.")
+    parser.add_argument("--resume",                     type=str,   default=None, help="Path to mid-run checkpoint .pt file for model state recovery.")
 
     parse_transport_args(parser)
-    args = parser.parse_args()
-    main(args)
+    main(parser.parse_args())
